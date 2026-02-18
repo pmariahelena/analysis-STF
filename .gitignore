@@ -1,0 +1,7 @@
+**/__pycache__/
+**/.venv/
+**/.DS_Store
+**/.pytest_cache/
+**/*.csv
+*.python-version
+Info.md
