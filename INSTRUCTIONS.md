@@ -74,7 +74,18 @@ uv run streamlit run dashboard.py
 
 This opens an interactive browser dashboard at `http://localhost:8501` for exploring the extracted STF data from `ArquivosConcatenados_1.csv`.
 
-The sidebar provides global filters (class, status, year range, state). The main area has tabs for overview, temporal analysis, geographic distribution, justice workload, petitioner analysis, complexity metrics, and a searchable case explorer.
+The sidebar provides global filters (class, status, year range, state). The main area has tabs:
+
+- **Visão Geral** – KPIs, status, class, type, and injunction breakdowns
+- **Temporal** – Filing trends by year, cumulative growth, physical-to-electronic transition
+- **Geográfico** – Cases by state of origin
+- **Relatores** – Justice workload distribution and timeline comparison
+- **Autores** – Petitioner categories and top filers over time
+- **Complexidade** – Movements, decisions, parties distributions and radar profile
+- **Sessões Virtuais** – Cases submitted to virtual sessions, session volume over time, busiest sessions, per-relator breakdown, destaque tracking (cases pulled to physical session, who requests them, cancellations, timeline), and a searchable session explorer
+- **Pedidos de Vista** – Which justices request vistas, how long they hold cases, vista duration analysis (pedido → devolução pairing), virtual vs physical session split, cases with the most vistas, and full explorer
+- **Votos Reajustados** – Cases where a justice readjusted their vote, by year, relator, class, decision type, and full-text search
+- **Explorar** – Filterable table of all cases
 
 ## Directory Structure
 
