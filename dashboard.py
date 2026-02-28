@@ -1724,13 +1724,27 @@ def render_complexity(df: pd.DataFrame):
 
     c1, c2 = st.columns(2)
     with c1:
-        fig = px.histogram(
-            df, x="len(andamentos_lista)", color="classe",
-            title="Distribuição de Andamentos por Processo",
-            color_discrete_map=COLORS,
-            nbins=60, barmode="overlay", opacity=0.7,
-            labels={"len(andamentos_lista)": "Nº de Andamentos", "classe": "Classe"},
+        max_and = int(df["len(andamentos_lista)"].max())
+        bins = list(range(0, max_and + 11, 10))
+        labels_and = [f"{b+1}–{b+10}" for b in bins[:-1]]
+        labels_and[0] = "0–10"
+        tmp = df[["len(andamentos_lista)", "classe"]].copy()
+        tmp["faixa"] = pd.cut(
+            tmp["len(andamentos_lista)"], bins=bins, labels=labels_and,
+            include_lowest=True, right=True,
         )
+        grouped = (
+            tmp.groupby(["faixa", "classe"], observed=True)
+            .size()
+            .reset_index(name="processos")
+        )
+        fig = px.bar(
+            grouped, x="faixa", y="processos", color="classe",
+            title="Distribuição de Andamentos por Processo (faixas de 10)",
+            color_discrete_map=COLORS,
+            labels={"faixa": "Nº de Andamentos", "processos": "Processos", "classe": "Classe"},
+        )
+        fig.update_layout(barmode="stack", xaxis_tickangle=-45)
         st.plotly_chart(fig, use_container_width=True)
 
     with c2:
@@ -1917,9 +1931,7 @@ def main():
     tabs = st.tabs([
         "📊 Visão Geral",
         "📅 Temporal",
-        "🗺️ Geográfico",
         "👤 Relatores",
-        "📝 Autores",
         "📈 Complexidade",
         "🖥️ Sessões Virtuais",
         "👁️ Pedidos de Vista",
@@ -1932,20 +1944,16 @@ def main():
     with tabs[1]:
         render_temporal(df)
     with tabs[2]:
-        render_geographic(df)
-    with tabs[3]:
         render_justices(df)
-    with tabs[4]:
-        render_petitioners(df)
-    with tabs[5]:
+    with tabs[3]:
         render_complexity(df)
-    with tabs[6]:
+    with tabs[4]:
         render_virtual_sessions(vs_raw, dest_raw, df)
-    with tabs[7]:
+    with tabs[5]:
         render_vistas(vt_raw, df)
-    with tabs[8]:
+    with tabs[6]:
         render_votos_reajustados(vr_raw, df)
-    with tabs[9]:
+    with tabs[7]:
         render_explorer(df)
 
 
