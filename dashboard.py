@@ -21,6 +21,40 @@ COLORS = {
     "ADO": "#d97706",
 }
 
+INCIDENT_TYPE_COLORS = {
+    "Principal (PR)": "#2563eb",
+    "Questões Incidentais (IJ)": "#7c3aed",
+    "Recurso (RC)": "#d97706",
+}
+
+INCIDENT_SUBTYPE_COLORS = {
+    "Mérito": "#2563eb",
+    "MC": "#7c3aed",
+    "MC-Ref": "#9333ea",
+    "TPI": "#0891b2",
+    "TPI-Ref": "#06b6d4",
+    "AgR": "#d97706",
+    "ED": "#dc2626",
+    "AgR-ED": "#f97316",
+    "ED-AgR": "#ea580c",
+}
+
+RESULT_COLORS = {
+    "Unanimidade": "#16a34a",
+    "Maioria (vencedor o relator)": "#2563eb",
+    "Maioria (vencido o relator)": "#dc2626",
+    "Sem resultado (destaque)": "#d97706",
+    "Sem resultado (vista)": "#9333ea",
+    "Não identificado": "#6b7280",
+}
+
+MODALIDADE_COLORS = {
+    "Só presencial": "#0891b2",
+    "Só virtual": "#7c3aed",
+    "Misto (virtual e presencial)": "#d97706",
+    "Só monocrática (sem julgamento colegiado)": "#6b7280",
+}
+
 UF_NAMES = {
     "AC": "Acre", "AL": "Alagoas", "AP": "Amapá", "AM": "Amazonas",
     "BA": "Bahia", "CE": "Ceará", "DF": "Distrito Federal", "ES": "Espírito Santo",
@@ -241,20 +275,121 @@ def _parse_date(s: str):
         return pd.NaT
 
 
-def _classify_incident(raw: str) -> str:
-    """Classify a virtual-session incident string into a broad category."""
+def _classify_incident(raw: str) -> tuple[str, str]:
+    """Classify a virtual-session incident per STF's 3-type taxonomy.
+
+    Returns (tipo_incidente, subtipo_incidente).
+    tipo: Principal (PR), Questões Incidentais (IJ), Recurso (RC).
+    """
     upper = raw.upper()
-    if "MC-REF" in upper or "-REF" in upper:
-        return "MC-Ref (Referendo)"
+
+    has_agr = "AGR" in upper
+    ed_match = re.search(r'(?:^|[\s\-./])ED(?:[\s\-./]|$)', upper)
+    has_ed = ed_match is not None
+
+    if has_agr and has_ed:
+        agr_pos = upper.index("AGR")
+        ed_pos = ed_match.start()
+        subtipo = "AgR-ED" if agr_pos < ed_pos else "ED-AgR"
+        return ("Recurso (RC)", subtipo)
+    if has_agr:
+        return ("Recurso (RC)", "AgR")
+    if has_ed:
+        return ("Recurso (RC)", "ED")
+
+    if "TPI" in upper:
+        return ("Questões Incidentais (IJ)", "TPI-Ref" if "REF" in upper else "TPI")
     if "MC" in upper:
-        return "Cautelar (MC)"
-    if "AGR" in upper:
-        return "Agravo (AgR)"
-    if "ED" in upper:
-        return "Embargos (ED)"
-    if raw in ("ADI", "ADPF", "ADC", "ADO") or "MÉRITO" in upper or "MERITO" in upper:
-        return "Mérito"
-    return "Mérito"
+        return ("Questões Incidentais (IJ)", "MC-Ref" if "REF" in upper else "MC")
+
+    return ("Principal (PR)", "Mérito")
+
+
+_SESSION_DESTAQUE_NAMES = {
+    "Retirado do Julgamento Virtual",
+    "Processo destacado no Julgamento Virtual",
+}
+
+_SESSION_VISTA_NAMES = {
+    "Vista ao(à) Ministro(a)",
+    "VISTA AO MINISTRO",
+    "VISTA À MINISTRA",
+    "Vista",
+    "VISTA",
+}
+
+
+def _determine_session_result(
+    andamentos: list[dict],
+    dt_inicio,
+    dt_fim,
+) -> str:
+    """Determine the voting result of a virtual session.
+
+    Categories:
+      - Unanimidade
+      - Maioria (vencedor o relator)
+      - Maioria (vencido o relator)
+      - Sem resultado (destaque)
+      - Sem resultado (vista)
+      - Não identificado
+    """
+    if pd.isna(dt_inicio):
+        return "Não identificado"
+
+    end_bound = (
+        dt_fim + pd.Timedelta(days=7)
+        if pd.notna(dt_fim)
+        else dt_inicio + pd.Timedelta(days=30)
+    )
+
+    has_destaque = False
+    has_vista = False
+    best_result = ""
+
+    for a in andamentos:
+        data_str = a.get("data", "")
+        try:
+            a_dt = pd.to_datetime(data_str, format="%d/%m/%Y")
+        except Exception:
+            continue
+
+        if a_dt < dt_inicio or a_dt > end_bound:
+            continue
+
+        nome = a.get("nome", "")
+        comp = a.get("complemento", "")
+
+        if nome in _SESSION_DESTAQUE_NAMES:
+            has_destaque = True
+
+        if nome in _SESSION_VISTA_NAMES or (
+            nome == "Suspenso o julgamento" and "vista" in comp.lower()
+        ):
+            has_vista = True
+
+        full = (nome + " " + comp).lower()
+        if "unanimidade" in full or "unânime" in full:
+            best_result = "unanimidade"
+        elif "maioria" in full and best_result != "unanimidade":
+            if "vencido" in full and (
+                "relator" in full or "relatora" in full
+            ):
+                best_result = "maioria_vencido"
+            elif best_result != "maioria_vencido":
+                best_result = "maioria"
+
+    if has_destaque:
+        return "Sem resultado (destaque)"
+    if has_vista:
+        return "Sem resultado (vista)"
+    if best_result == "unanimidade":
+        return "Unanimidade"
+    if best_result == "maioria_vencido":
+        return "Maioria (vencido o relator)"
+    if best_result == "maioria":
+        return "Maioria (vencedor o relator)"
+    return "Não identificado"
 
 
 @st.cache_data(show_spinner="Extraindo sessões virtuais dos andamentos...")
@@ -352,13 +487,17 @@ def load_virtual_sessions(path: str) -> pd.DataFrame:
                 "sessao_fim": dt_fim,
                 "lista": lista,
                 "incidente_raw": incidente_raw,
+                "resultado_sessao": _determine_session_result(
+                    andamentos, dt_inicio, dt_fim,
+                ),
             })
 
     if not records:
         return pd.DataFrame(columns=[
             "processo", "classe", "relator",
             "sessao_inicio", "sessao_fim", "lista",
-            "incidente_raw", "incidente_tipo",
+            "incidente_raw", "incidente_tipo", "incidente_subtipo",
+            "resultado_sessao",
         ])
 
     vs = pd.DataFrame(records)
@@ -371,9 +510,11 @@ def load_virtual_sessions(path: str) -> pd.DataFrame:
         else (f"{d.year}-S2" if pd.notna(d) else None)
     )
 
-    vs["incidente_tipo"] = vs["incidente_raw"].apply(
-        lambda x: _classify_incident(x) if x else "Mérito"
+    incidente_class = vs["incidente_raw"].apply(
+        lambda x: _classify_incident(x) if x else ("Principal (PR)", "Mérito")
     )
+    vs["incidente_tipo"] = incidente_class.apply(lambda x: x[0])
+    vs["incidente_subtipo"] = incidente_class.apply(lambda x: x[1])
 
     vs["duracao_dias"] = (vs["sessao_fim"] - vs["sessao_inicio"]).dt.days
     vs["tipo_sessao"] = vs["duracao_dias"].apply(
@@ -403,6 +544,15 @@ _DESTAQUE_NAMES = {
 _RE_SESSAO_DESTAQUE = re.compile(
     r"Sess[ãa]o de\s*(\d{2}/\d{2}/\d{4})\s*a\s*(\d{2}/\d{2}/\d{4})"
 )
+
+
+def _normalize_minister_name(name: str) -> str:
+    """Strip common prefixes so relator and julgador names can be compared."""
+    s = re.sub(
+        r'^(?:MIN\.?\s*|MINISTR[OA]\s+)',
+        '', str(name).strip(), flags=re.IGNORECASE,
+    )
+    return s.strip().upper()
 
 
 @st.cache_data(show_spinner="Extraindo destaques das sessões virtuais...")
@@ -460,6 +610,7 @@ def load_destaques(path: str) -> pd.DataFrame:
         return pd.DataFrame(columns=[
             "processo", "classe", "relator", "data", "evento",
             "ministro_destaque", "sessao_destaque", "complemento",
+            "is_autodestaque", "tipo_autoria",
         ])
 
     dest = pd.DataFrame(records)
@@ -489,7 +640,142 @@ def load_destaques(path: str) -> pd.DataFrame:
     else:
         dest["rodada"] = 0
 
+    dest["is_autodestaque"] = dest.apply(
+        lambda r: (
+            _normalize_minister_name(r["relator"])
+            == _normalize_minister_name(r["ministro_destaque"])
+        )
+        if r["ministro_destaque"] not in ("NA", "")
+        else False,
+        axis=1,
+    )
+    dest["tipo_autoria"] = dest.apply(
+        lambda r: "Autodestaque (relator)"
+        if r["is_autodestaque"]
+        else (
+            "Destaque por outro ministro"
+            if r["ministro_destaque"] not in ("NA", "")
+            else "Ministro não identificado"
+        ),
+        axis=1,
+    )
+
     return dest
+
+
+_DESTAQUE_PULL_NAMES = {
+    "Retirado do Julgamento Virtual",
+    "Processo destacado no Julgamento Virtual",
+}
+
+
+@st.cache_data(show_spinner="Identificando cancelamentos de destaque...")
+def load_destaque_cancelamentos(path: str) -> pd.DataFrame:
+    """Identify both formal and informal destaque cancellations.
+
+    Formal: andamento 'Pedido de destaque cancelado' (from late 2022).
+    Informal: destaque followed by return to virtual session with no vista
+    in between.
+    """
+    raw = pd.read_csv(
+        path,
+        usecols=["nome_processo", "classe", "relator", "andamentos_lista"],
+    )
+
+    records = []
+    for _, row in raw.iterrows():
+        try:
+            andamentos = json.loads(row["andamentos_lista"])
+        except Exception:
+            continue
+
+        events = []
+        for a in andamentos:
+            nome = a.get("nome", "")
+            comp = a.get("complemento", "")
+            data_str = a.get("data", "")
+            try:
+                dt = pd.to_datetime(data_str, format="%d/%m/%Y")
+            except Exception:
+                dt = pd.NaT
+
+            if nome in _DESTAQUE_PULL_NAMES:
+                events.append(("destaque", dt, nome, comp))
+            elif nome == "Iniciado Julgamento Virtual":
+                events.append(("virtual_return", dt, nome, comp))
+            elif "Inclua-se em pauta" in nome and "Virtual" in comp:
+                events.append(("virtual_return", dt, nome, comp))
+            elif "vista" in nome.lower():
+                events.append(("vista", dt, nome, comp))
+            elif nome == "Pedido de destaque cancelado":
+                events.append(("formal_cancel", dt, nome, comp))
+
+        events.sort(key=lambda x: x[1] if pd.notna(x[1]) else pd.Timestamp.max)
+
+        for i, (etype, edt, ename, ecomp) in enumerate(events):
+            if etype == "formal_cancel":
+                records.append({
+                    "processo": row["nome_processo"],
+                    "classe": row["classe"],
+                    "relator": row["relator"],
+                    "data_destaque": edt,
+                    "data_retorno": edt,
+                    "gap_dias": 0,
+                    "tipo_cancelamento": "Formal",
+                })
+                continue
+
+            if etype != "destaque":
+                continue
+
+            has_vista = False
+            found_return = False
+            return_dt = pd.NaT
+            for j in range(i + 1, len(events)):
+                next_type = events[j][0]
+                if next_type == "vista":
+                    has_vista = True
+                    break
+                if next_type == "formal_cancel":
+                    break
+                if next_type == "virtual_return":
+                    found_return = True
+                    return_dt = events[j][1]
+                    break
+
+            if found_return and not has_vista:
+                gap = (
+                    (return_dt - edt).days
+                    if pd.notna(edt) and pd.notna(return_dt)
+                    else None
+                )
+                records.append({
+                    "processo": row["nome_processo"],
+                    "classe": row["classe"],
+                    "relator": row["relator"],
+                    "data_destaque": edt,
+                    "data_retorno": return_dt,
+                    "gap_dias": gap,
+                    "tipo_cancelamento": "Informal",
+                })
+
+    if not records:
+        return pd.DataFrame(columns=[
+            "processo", "classe", "relator", "data_destaque",
+            "data_retorno", "gap_dias", "tipo_cancelamento",
+        ])
+
+    dc = pd.DataFrame(records)
+    dc["ano"] = dc["data_destaque"].dt.year
+    dc["faixa_gap"] = pd.cut(
+        dc["gap_dias"],
+        bins=[-1, 0, 7, 30, 180, 365, 99999],
+        labels=[
+            "Mesmo dia", "1–7 dias", "8–30 dias",
+            "1–6 meses", "6–12 meses", ">1 ano",
+        ],
+    )
+    return dc
 
 
 _REAJUSTE_TERMS = [
@@ -498,53 +784,163 @@ _REAJUSTE_TERMS = [
 ]
 
 
-@st.cache_data(show_spinner="Extraindo votos reajustados...")
-def load_votos_reajustados(path: str) -> pd.DataFrame:
+_RE_SESSAO_VIRTUAL_DEC = re.compile(
+    r"[Ss]ess[ãa]o\s+[Vv]irtual.*?(\d{2}/\d{2}/\d{4})\s*a\s*(\d{2}/\d{2}/\d{4})",
+    re.DOTALL,
+)
+
+
+@st.cache_data(show_spinner="Extraindo votos alterados das decisões...")
+def load_votos_alterados(path: str) -> pd.DataFrame:
     raw = pd.read_csv(
         path,
-        usecols=["nome_processo", "classe", "relator", "decisões",
-                 "andamentos_lista"],
+        usecols=["nome_processo", "classe", "relator", "decisões"],
     )
 
     records = []
-    seen = set()
     for _, row in raw.iterrows():
-        for col_name in ("decisões", "andamentos_lista"):
-            try:
-                items = json.loads(row[col_name])
-            except Exception:
+        try:
+            decisoes = json.loads(row["decisões"])
+        except Exception:
+            continue
+
+        for d in decisoes:
+            nome = d.get("nome", "")
+            comp = d.get("complemento", "")
+            text = (nome + " " + comp).lower()
+            if not any(t in text for t in _REAJUSTE_TERMS):
                 continue
 
-            for a in items:
-                text = (a.get("nome", "") + " " + a.get("complemento", "")).lower()
-                if not any(t in text for t in _REAJUSTE_TERMS):
-                    continue
+            m_virtual = _RE_SESSAO_VIRTUAL_DEC.search(comp)
+            if m_virtual:
+                tipo_sessao = "Virtual"
+                sessao_inicio = _parse_date(m_virtual.group(1))
+                sessao_fim = _parse_date(m_virtual.group(2))
+            else:
+                tipo_sessao = "Presencial"
+                sessao_inicio = pd.NaT
+                sessao_fim = pd.NaT
 
-                key = (row["nome_processo"], a.get("data", ""), a.get("nome", ""))
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                records.append({
-                    "processo": row["nome_processo"],
-                    "classe": row["classe"],
-                    "relator": row["relator"],
-                    "data": a.get("data", ""),
-                    "andamento": a.get("nome", ""),
-                    "julgador": a.get("julgador", "NA"),
-                    "complemento": a.get("complemento", "")[:800],
-                })
+            records.append({
+                "processo": row["nome_processo"],
+                "classe": row["classe"],
+                "relator": row["relator"],
+                "data": d.get("data", ""),
+                "nome_decisao": nome,
+                "julgador": d.get("julgador", "NA"),
+                "complemento": comp[:800],
+                "tipo_sessao_voto": tipo_sessao,
+                "sessao_inicio": sessao_inicio,
+                "sessao_fim": sessao_fim,
+            })
 
     if not records:
         return pd.DataFrame(columns=[
             "processo", "classe", "relator", "data",
-            "andamento", "julgador", "complemento",
+            "nome_decisao", "julgador", "complemento",
+            "tipo_sessao_voto", "sessao_inicio", "sessao_fim",
         ])
 
-    vr = pd.DataFrame(records)
-    vr["data_dt"] = pd.to_datetime(vr["data"], format="%d/%m/%Y", errors="coerce")
-    vr["ano"] = vr["data_dt"].dt.year
-    return vr
+    va = pd.DataFrame(records)
+    va["data_dt"] = pd.to_datetime(va["data"], format="%d/%m/%Y", errors="coerce")
+    va["ano"] = va["data_dt"].dt.year
+    va["sessao_inicio"] = pd.to_datetime(va["sessao_inicio"], errors="coerce")
+    va["sessao_fim"] = pd.to_datetime(va["sessao_fim"], errors="coerce")
+    return va
+
+
+def _enrich_votos_alterados(
+    va: pd.DataFrame, vs: pd.DataFrame,
+) -> pd.DataFrame:
+    """Add incidente_tipo to votos alterados by joining with virtual-sessions."""
+    if va.empty:
+        va["incidente_tipo"] = pd.Series(dtype=str)
+        return va
+
+    va = va.copy()
+
+    if vs.empty or "sessao_inicio" not in vs.columns:
+        va["incidente_tipo"] = "Não identificado"
+        return va
+
+    vs_key = (
+        vs[["processo", "sessao_inicio", "incidente_tipo"]]
+        .drop_duplicates(subset=["processo", "sessao_inicio"])
+    )
+
+    merged = va.merge(
+        vs_key,
+        on=["processo", "sessao_inicio"],
+        how="left",
+        suffixes=("", "_vs"),
+    )
+    merged["incidente_tipo"] = merged["incidente_tipo"].fillna("Não identificado")
+    return merged
+
+
+@st.cache_data(show_spinner="Classificando modalidade de julgamento dos processos...")
+def load_case_venue(path: str) -> pd.DataFrame:
+    """Classify each case's collegial judgment venue: virtual, presencial, or mixed."""
+    raw = pd.read_csv(
+        path,
+        usecols=["nome_processo", "decisões"],
+    )
+
+    records = []
+    for _, row in raw.iterrows():
+        try:
+            decisoes = json.loads(row["decisões"])
+        except Exception:
+            decisoes = []
+
+        n_virtual = 0
+        n_presencial = 0
+
+        for d in decisoes:
+            julgador = d.get("julgador", "")
+            comp = d.get("complemento", "")
+            full = (julgador + " " + comp).lower()
+
+            is_collegial = any(
+                t in full
+                for t in (
+                    "tribunal pleno", "plenário", "turma",
+                    "sessão virtual",
+                )
+            )
+            if not is_collegial:
+                continue
+
+            if "sessão virtual" in full:
+                n_virtual += 1
+            else:
+                n_presencial += 1
+
+        records.append({
+            "processo": row["nome_processo"],
+            "n_decisoes_virtual": n_virtual,
+            "n_decisoes_presencial": n_presencial,
+        })
+
+    if not records:
+        return pd.DataFrame(columns=[
+            "processo", "n_decisoes_virtual", "n_decisoes_presencial",
+            "modalidade",
+        ])
+
+    venue = pd.DataFrame(records)
+
+    def _classify_venue(r):
+        if r["n_decisoes_virtual"] > 0 and r["n_decisoes_presencial"] > 0:
+            return "Misto (virtual e presencial)"
+        if r["n_decisoes_virtual"] > 0:
+            return "Só virtual"
+        if r["n_decisoes_presencial"] > 0:
+            return "Só presencial"
+        return "Só monocrática (sem julgamento colegiado)"
+
+    venue["modalidade"] = venue.apply(_classify_venue, axis=1)
+    return venue
 
 
 def render_virtual_sessions(vs: pd.DataFrame, df_main: pd.DataFrame):
@@ -721,9 +1117,23 @@ def render_virtual_sessions(vs: pd.DataFrame, df_main: pd.DataFrame):
         fig.update_traces(marker_color="#7c3aed")
         st.plotly_chart(fig, use_container_width=True)
 
-    # --- Tipo de Incidente ---
+    # --- Tipo de Incidente (classificação STF) ---
     st.divider()
     st.subheader("Tipo de Incidente Julgado nas Sessões Virtuais")
+    st.caption(
+        "Classificação conforme taxonomia do STF: "
+        "**Principal (PR)** = julgamento de mérito; "
+        "**Questões Incidentais (IJ)** = MC, MC-Ref, TPI, TPI-Ref; "
+        "**Recurso (RC)** = AgR, ED, AgR-ED, ED-AgR."
+    )
+
+    ki1, ki2, ki3 = st.columns(3)
+    for col, tipo in zip(
+        [ki1, ki2, ki3],
+        ["Principal (PR)", "Questões Incidentais (IJ)", "Recurso (RC)"],
+    ):
+        count = int((vs_f["incidente_tipo"] == tipo).sum())
+        col.metric(tipo, f"{count:,}")
 
     ci1, ci2 = st.columns(2)
     with ci1:
@@ -734,46 +1144,62 @@ def render_virtual_sessions(vs: pd.DataFrame, df_main: pd.DataFrame):
             title="Incidentes por Tipo",
             hole=0.4,
             color="Tipo",
-            color_discrete_map={
-                "Mérito": "#2563eb",
-                "Embargos (ED)": "#d97706",
-                "Agravo (AgR)": "#dc2626",
-                "MC-Ref (Referendo)": "#7c3aed",
-                "Cautelar (MC)": "#0891b2",
-                "Não identificado": "#6b7280",
-                "Outro": "#9ca3af",
-            },
+            color_discrete_map=INCIDENT_TYPE_COLORS,
         )
         fig.update_traces(textinfo="value+percent")
         st.plotly_chart(fig, use_container_width=True)
 
     with ci2:
-        inc_year = (
-            vs_f.dropna(subset=["ano_sessao"])
-            .groupby(["ano_sessao", "incidente_tipo"])
-            .size()
-            .reset_index(name="inclusoes")
+        sub_counts = vs_f["incidente_subtipo"].value_counts().reset_index()
+        sub_counts.columns = ["Subtipo", "Inclusões"]
+        fig = px.pie(
+            sub_counts, names="Subtipo", values="Inclusões",
+            title="Detalhamento por Subtipo",
+            hole=0.4,
+            color="Subtipo",
+            color_discrete_map=INCIDENT_SUBTYPE_COLORS,
         )
-        inc_year["ano_sessao"] = inc_year["ano_sessao"].astype(int)
-        fig = px.bar(
-            inc_year, x="ano_sessao", y="inclusoes", color="incidente_tipo",
-            title="Tipo de Incidente por Ano",
-            color_discrete_map={
-                "Mérito": "#2563eb",
-                "Embargos (ED)": "#d97706",
-                "Agravo (AgR)": "#dc2626",
-                "MC-Ref (Referendo)": "#7c3aed",
-                "Cautelar (MC)": "#0891b2",
-                "Não identificado": "#6b7280",
-                "Outro": "#9ca3af",
-            },
-            labels={
-                "ano_sessao": "Ano", "inclusoes": "Inclusões",
-                "incidente_tipo": "Tipo de Incidente",
-            },
-        )
-        fig.update_layout(barmode="stack", xaxis_dtick=1)
+        fig.update_traces(textinfo="value+percent")
         st.plotly_chart(fig, use_container_width=True)
+
+    inc_year = (
+        vs_f.dropna(subset=["ano_sessao"])
+        .groupby(["ano_sessao", "incidente_tipo"])
+        .size()
+        .reset_index(name="inclusoes")
+    )
+    inc_year["ano_sessao"] = inc_year["ano_sessao"].astype(int)
+    fig = px.bar(
+        inc_year, x="ano_sessao", y="inclusoes", color="incidente_tipo",
+        title="Tipo de Incidente por Ano",
+        color_discrete_map=INCIDENT_TYPE_COLORS,
+        labels={
+            "ano_sessao": "Ano", "inclusoes": "Inclusões",
+            "incidente_tipo": "Tipo de Incidente",
+        },
+        text_auto=True,
+    )
+    fig.update_layout(barmode="stack", xaxis_dtick=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+    sub_year = (
+        vs_f.dropna(subset=["ano_sessao"])
+        .groupby(["ano_sessao", "incidente_subtipo"])
+        .size()
+        .reset_index(name="inclusoes")
+    )
+    sub_year["ano_sessao"] = sub_year["ano_sessao"].astype(int)
+    fig = px.bar(
+        sub_year, x="ano_sessao", y="inclusoes", color="incidente_subtipo",
+        title="Subtipo de Incidente por Ano",
+        color_discrete_map=INCIDENT_SUBTYPE_COLORS,
+        labels={
+            "ano_sessao": "Ano", "inclusoes": "Inclusões",
+            "incidente_subtipo": "Subtipo",
+        },
+    )
+    fig.update_layout(barmode="stack", xaxis_dtick=1)
+    st.plotly_chart(fig, use_container_width=True)
 
     inc_sem = (
         vs_f.dropna(subset=["semestre"])
@@ -784,15 +1210,7 @@ def render_virtual_sessions(vs: pd.DataFrame, df_main: pd.DataFrame):
     fig = px.bar(
         inc_sem, x="semestre", y="inclusoes", color="incidente_tipo",
         title="Tipo de Incidente por Semestre",
-        color_discrete_map={
-            "Mérito": "#2563eb",
-            "Embargos (ED)": "#d97706",
-            "Agravo (AgR)": "#dc2626",
-            "MC-Ref (Referendo)": "#7c3aed",
-            "Cautelar (MC)": "#0891b2",
-            "Não identificado": "#6b7280",
-            "Outro": "#9ca3af",
-        },
+        color_discrete_map=INCIDENT_TYPE_COLORS,
         labels={
             "semestre": "Semestre", "inclusoes": "Inclusões",
             "incidente_tipo": "Tipo de Incidente",
@@ -800,6 +1218,154 @@ def render_virtual_sessions(vs: pd.DataFrame, df_main: pd.DataFrame):
     )
     fig.update_layout(barmode="stack", xaxis_tickangle=-45)
     st.plotly_chart(fig, use_container_width=True)
+
+    # --- Resultado da Sessão Virtual ---
+    st.divider()
+    st.subheader("Resultado das Sessões Virtuais")
+    st.caption(
+        "Classificação do desfecho de cada inclusão em sessão virtual: "
+        "**Unanimidade**, **Maioria (vencedor o relator)**, "
+        "**Maioria (vencido o relator)**, ou **Sem resultado** "
+        "(quando houve pedido de destaque ou de vista antes da conclusão)."
+    )
+
+    rk1, rk2, rk3, rk4, rk5 = st.columns(5)
+    for col, label in zip(
+        [rk1, rk2, rk3, rk4, rk5],
+        [
+            "Unanimidade",
+            "Maioria (vencedor o relator)",
+            "Maioria (vencido o relator)",
+            "Sem resultado (destaque)",
+            "Sem resultado (vista)",
+        ],
+    ):
+        count = int((vs_f["resultado_sessao"] == label).sum())
+        col.metric(label, f"{count:,}")
+
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        res_counts = vs_f["resultado_sessao"].value_counts().reset_index()
+        res_counts.columns = ["Resultado", "Inclusões"]
+        fig = px.pie(
+            res_counts, names="Resultado", values="Inclusões",
+            title="Distribuição dos Resultados",
+            hole=0.4,
+            color="Resultado",
+            color_discrete_map=RESULT_COLORS,
+        )
+        fig.update_traces(textinfo="value+percent")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with rc2:
+        res_year = (
+            vs_f.dropna(subset=["ano_sessao"])
+            .groupby(["ano_sessao", "resultado_sessao"])
+            .size()
+            .reset_index(name="inclusoes")
+        )
+        res_year["ano_sessao"] = res_year["ano_sessao"].astype(int)
+        fig = px.bar(
+            res_year, x="ano_sessao", y="inclusoes", color="resultado_sessao",
+            title="Resultado por Ano",
+            color_discrete_map=RESULT_COLORS,
+            labels={
+                "ano_sessao": "Ano", "inclusoes": "Inclusões",
+                "resultado_sessao": "Resultado",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack", xaxis_dtick=1)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --- Resultado × Classe ---
+    rc3, rc4 = st.columns(2)
+    with rc3:
+        res_classe = (
+            vs_f.groupby(["classe", "resultado_sessao"])
+            .size()
+            .reset_index(name="inclusoes")
+        )
+        fig = px.bar(
+            res_classe, x="classe", y="inclusoes", color="resultado_sessao",
+            title="Resultado por Classe Processual",
+            color_discrete_map=RESULT_COLORS,
+            labels={
+                "classe": "Classe", "inclusoes": "Inclusões",
+                "resultado_sessao": "Resultado",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with rc4:
+        res_inc = (
+            vs_f.groupby(["incidente_tipo", "resultado_sessao"])
+            .size()
+            .reset_index(name="inclusoes")
+        )
+        fig = px.bar(
+            res_inc, x="incidente_tipo", y="inclusoes", color="resultado_sessao",
+            title="Resultado por Tipo de Incidente",
+            color_discrete_map=RESULT_COLORS,
+            labels={
+                "incidente_tipo": "Tipo de Incidente", "inclusoes": "Inclusões",
+                "resultado_sessao": "Resultado",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --- Resultado × Classe × Incidente (percentage view) ---
+    decided = vs_f[~vs_f["resultado_sessao"].isin(
+        ["Não identificado", "Sem resultado (destaque)", "Sem resultado (vista)"]
+    )]
+    if not decided.empty:
+        st.caption(
+            "Proporção entre unanimidade e maioria (excluindo sessões sem "
+            "resultado e não identificadas):"
+        )
+        rc5, rc6 = st.columns(2)
+        with rc5:
+            dec_classe = (
+                decided.groupby(["classe", "resultado_sessao"])
+                .size()
+                .reset_index(name="inclusoes")
+            )
+            fig = px.bar(
+                dec_classe, x="classe", y="inclusoes", color="resultado_sessao",
+                title="Unanimidade vs Maioria por Classe",
+                color_discrete_map=RESULT_COLORS,
+                labels={
+                    "classe": "Classe", "inclusoes": "Inclusões",
+                    "resultado_sessao": "Resultado",
+                },
+                text_auto=True,
+            )
+            fig.update_layout(barmode="stack")
+            st.plotly_chart(fig, use_container_width=True)
+
+        with rc6:
+            dec_inc = (
+                decided.groupby(["incidente_tipo", "resultado_sessao"])
+                .size()
+                .reset_index(name="inclusoes")
+            )
+            fig = px.bar(
+                dec_inc, x="incidente_tipo", y="inclusoes", color="resultado_sessao",
+                title="Unanimidade vs Maioria por Tipo de Incidente",
+                color_discrete_map=RESULT_COLORS,
+                labels={
+                    "incidente_tipo": "Tipo de Incidente",
+                    "inclusoes": "Inclusões",
+                    "resultado_sessao": "Resultado",
+                },
+                text_auto=True,
+            )
+            fig.update_layout(barmode="stack")
+            st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
@@ -860,7 +1426,8 @@ def render_virtual_sessions(vs: pd.DataFrame, df_main: pd.DataFrame):
     )
     explorer = vs_f[[
         "processo", "classe", "relator", "sessao_label",
-        "tipo_sessao", "lista", "incidente_tipo",
+        "tipo_sessao", "lista", "incidente_tipo", "incidente_subtipo",
+        "resultado_sessao",
     ]].rename(columns={
         "processo": "Processo",
         "classe": "Classe",
@@ -868,7 +1435,9 @@ def render_virtual_sessions(vs: pd.DataFrame, df_main: pd.DataFrame):
         "sessao_label": "Sessão (Período)",
         "tipo_sessao": "Tipo Sessão",
         "lista": "Lista",
-        "incidente_tipo": "Incidente",
+        "incidente_tipo": "Tipo Incidente",
+        "incidente_subtipo": "Subtipo",
+        "resultado_sessao": "Resultado",
     }).sort_values("Sessão (Período)", ascending=False)
 
     if search_session:
@@ -945,6 +1514,99 @@ def render_destaques(dest: pd.DataFrame, df_main: pd.DataFrame):
     dc6.metric("Destaques Cancelados", f"{n_cancelled:,}")
     dc7.metric("Julgados no Presencial", f"{n_physical:,}")
 
+    # --- Autodestaque analysis ---
+    pull_events = real_destaques[
+        real_destaques["evento"] == "Destaque (retirado da virtual)"
+    ]
+    n_auto = int(pull_events["is_autodestaque"].sum())
+    n_outro = int(
+        ((~pull_events["is_autodestaque"])
+         & (pull_events["ministro_destaque"] != "NA")).sum()
+    )
+    n_nao_id = int((pull_events["ministro_destaque"] == "NA").sum())
+
+    st.divider()
+    st.subheader("Autodestaque – Relator vs Outro Ministro")
+    st.caption(
+        "**Autodestaque**: o próprio relator do processo solicita a retirada "
+        "da sessão virtual. Quando outro ministro solicita, trata-se de destaque "
+        "por ministro diverso do relator."
+    )
+
+    da1, da2, da3 = st.columns(3)
+    da1.metric("Autodestaques (relator)", f"{n_auto:,}")
+    da2.metric("Destaque por Outro Ministro", f"{n_outro:,}")
+    da3.metric("Ministro Não Identificado", f"{n_nao_id:,}")
+
+    AUTORIA_COLORS = {
+        "Autodestaque (relator)": "#d97706",
+        "Destaque por outro ministro": "#2563eb",
+        "Ministro não identificado": "#6b7280",
+    }
+
+    da4, da5 = st.columns(2)
+    with da4:
+        autoria_df = (
+            pull_events["tipo_autoria"].value_counts().reset_index()
+        )
+        autoria_df.columns = ["Autoria", "Destaques"]
+        fig = px.pie(
+            autoria_df, names="Autoria", values="Destaques",
+            title="Quem Solicita o Destaque?",
+            hole=0.4,
+            color="Autoria",
+            color_discrete_map=AUTORIA_COLORS,
+        )
+        fig.update_traces(textinfo="value+percent")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with da5:
+        autoria_year = (
+            pull_events.dropna(subset=["ano"])
+            .groupby(["ano", "tipo_autoria"])
+            .size()
+            .reset_index(name="destaques")
+        )
+        if not autoria_year.empty:
+            autoria_year["ano"] = autoria_year["ano"].astype(int)
+            fig = px.bar(
+                autoria_year, x="ano", y="destaques", color="tipo_autoria",
+                title="Autodestaque vs Outro Ministro por Ano",
+                color_discrete_map=AUTORIA_COLORS,
+                labels={
+                    "ano": "Ano", "destaques": "Destaques",
+                    "tipo_autoria": "Autoria",
+                },
+                text_auto=True,
+            )
+            fig.update_layout(barmode="stack", xaxis_dtick=1)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # --- Top ministers requesting destaques, split by auto/other ---
+    known = pull_events[pull_events["ministro_destaque"] != "NA"]
+    if not known.empty:
+        min_autoria = (
+            known.groupby(["ministro_destaque", "tipo_autoria"])
+            .size()
+            .reset_index(name="destaques")
+        )
+        fig = px.bar(
+            min_autoria, x="destaques", y="ministro_destaque",
+            color="tipo_autoria", orientation="h",
+            title="Ministros que Solicitam Destaque (autodestaque vs outro)",
+            color_discrete_map=AUTORIA_COLORS,
+            labels={
+                "ministro_destaque": "Ministro",
+                "destaques": "Destaques",
+                "tipo_autoria": "Autoria",
+            },
+        )
+        fig.update_layout(
+            yaxis=dict(categoryorder="total ascending"),
+            barmode="stack",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
     st.divider()
 
     dc5, dc6 = st.columns(2)
@@ -968,7 +1630,7 @@ def render_destaques(dest: pd.DataFrame, df_main: pd.DataFrame):
             req_counts.columns = ["Ministro", "Eventos"]
             fig = px.bar(
                 req_counts, x="Eventos", y="Ministro", orientation="h",
-                title="Ministros em Eventos de Destaque",
+                title="Ministros em Eventos de Destaque (todos os tipos)",
                 color="Eventos", color_continuous_scale="Reds",
             )
             fig.update_layout(yaxis=dict(categoryorder="total ascending"))
@@ -1066,7 +1728,7 @@ def render_destaques(dest: pd.DataFrame, df_main: pd.DataFrame):
     st.subheader("Tabela de Destaques")
     dest_display = real_destaques[[
         "processo", "classe", "relator", "data", "rodada", "evento",
-        "ministro_destaque", "sessao_destaque",
+        "ministro_destaque", "tipo_autoria", "sessao_destaque",
     ]].rename(columns={
         "processo": "Processo",
         "classe": "Classe",
@@ -1074,137 +1736,817 @@ def render_destaques(dest: pd.DataFrame, df_main: pd.DataFrame):
         "data": "Data",
         "rodada": "Rodada",
         "evento": "Evento",
-        "ministro_destaque": "Ministro",
+        "ministro_destaque": "Min. Destaque",
+        "tipo_autoria": "Autoria",
         "sessao_destaque": "Sessão Virtual",
     }).sort_values(["Processo", "Data"], ascending=[True, False])
     st.dataframe(dest_display, use_container_width=True, height=400)
 
 
-def render_votos_reajustados(vr: pd.DataFrame, df_main: pd.DataFrame):
-    st.header("Votos Reajustados")
+def render_cancelamentos(dc: pd.DataFrame, df_main: pd.DataFrame):
+    st.header("Cancelamentos de Destaque – Formal e Informal")
+    st.caption(
+        "**Formal**: andamento 'Pedido de destaque cancelado' (a partir de nov/2022). "
+        "**Informal**: caso destacado que retorna à sessão virtual sem vista "
+        "intermediária — prática identificada desde dez/2017."
+    )
 
-    if vr.empty:
-        st.warning("Nenhum voto reajustado encontrado nos dados.")
+    if dc.empty:
+        st.warning("Nenhum cancelamento de destaque encontrado.")
         return
 
     filtered_processes = set(df_main["nome_processo"])
-    vr_f = vr[vr["processo"].isin(filtered_processes)].copy()
+    dc_f = dc[dc["processo"].isin(filtered_processes)].copy()
 
-    if vr_f.empty:
-        st.info("Nenhum voto reajustado nos processos filtrados.")
+    if dc_f.empty:
+        st.info("Nenhum cancelamento nos processos filtrados.")
         return
 
-    n_cases = vr_f["processo"].nunique()
-    n_events = len(vr_f)
+    n_total = len(dc_f)
+    n_formal = len(dc_f[dc_f["tipo_cancelamento"] == "Formal"])
+    n_informal = len(dc_f[dc_f["tipo_cancelamento"] == "Informal"])
+    n_cases = dc_f["processo"].nunique()
+    median_gap = dc_f.loc[dc_f["tipo_cancelamento"] == "Informal", "gap_dias"].median()
 
-    cols = st.columns(4)
-    cols[0].metric("Processos com Voto Reajustado", f"{n_cases:,}")
-    cols[1].metric("Total de Ocorrências", f"{n_events:,}")
-    pct = n_cases / len(df_main) * 100 if len(df_main) > 0 else 0
-    cols[2].metric("% do Total de Processos", f"{pct:.2f}%")
-    n_relatores = vr_f["relator"].nunique()
-    cols[3].metric("Relatores Envolvidos", f"{n_relatores:,}")
+    kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+    kc1.metric("Total de Cancelamentos", f"{n_total:,}")
+    kc2.metric("Formais", f"{n_formal:,}")
+    kc3.metric("Informais", f"{n_informal:,}")
+    kc4.metric("Processos Envolvidos", f"{n_cases:,}")
+    kc5.metric("Mediana do Gap (informal)", f"{int(median_gap)} dias" if pd.notna(median_gap) else "—")
 
     st.divider()
 
-    c1, c2 = st.columns(2)
-
-    with c1:
-        yearly = (
-            vr_f.dropna(subset=["ano"])
-            .groupby("ano")
-            .size()
-            .reset_index(name="ocorrencias")
-        )
-        if not yearly.empty:
-            yearly["ano"] = yearly["ano"].astype(int)
-            fig = px.bar(
-                yearly, x="ano", y="ocorrencias",
-                title="Votos Reajustados por Ano",
-                labels={"ano": "Ano", "ocorrencias": "Ocorrências"},
-                text_auto=True,
-            )
-            fig.update_traces(marker_color="#0891b2")
-            st.plotly_chart(fig, use_container_width=True)
-
-    with c2:
-        rel_counts = vr_f["relator"].value_counts().reset_index()
-        rel_counts.columns = ["Relator", "Ocorrências"]
-        fig = px.bar(
-            rel_counts, x="Ocorrências", y="Relator", orientation="h",
-            title="Votos Reajustados por Relator",
-            color="Ocorrências", color_continuous_scale="Teal",
-        )
-        fig.update_layout(yaxis=dict(categoryorder="total ascending"))
-        fig.update_coloraxes(showscale=False)
-        st.plotly_chart(fig, use_container_width=True)
-
-    c3, c4 = st.columns(2)
-
-    with c3:
-        classe_counts = vr_f["classe"].value_counts().reset_index()
-        classe_counts.columns = ["Classe", "Ocorrências"]
+    # --- Formal vs Informal pie ---
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        tipo_df = dc_f["tipo_cancelamento"].value_counts().reset_index()
+        tipo_df.columns = ["Tipo", "Cancelamentos"]
         fig = px.pie(
-            classe_counts, names="Classe", values="Ocorrências",
-            title="Votos Reajustados por Classe",
-            color="Classe", color_discrete_map=COLORS,
+            tipo_df, names="Tipo", values="Cancelamentos",
+            title="Cancelamentos: Formal vs Informal",
             hole=0.4,
+            color="Tipo",
+            color_discrete_map={
+                "Formal": "#2563eb",
+                "Informal": "#d97706",
+            },
         )
         fig.update_traces(textinfo="value+percent")
         st.plotly_chart(fig, use_container_width=True)
 
-    with c4:
-        tipo_counts = vr_f["andamento"].value_counts().reset_index()
-        tipo_counts.columns = ["Tipo de Decisão", "Ocorrências"]
+    with cc2:
+        # --- By year, stacked formal/informal ---
+        yr_df = (
+            dc_f.dropna(subset=["ano"])
+            .groupby(["ano", "tipo_cancelamento"])
+            .size()
+            .reset_index(name="cancelamentos")
+        )
+        yr_df["ano"] = yr_df["ano"].astype(int)
         fig = px.bar(
-            tipo_counts, x="Ocorrências", y="Tipo de Decisão", orientation="h",
-            title="Em Que Tipo de Decisão Ocorre o Reajuste?",
-            color="Ocorrências", color_continuous_scale="Teal",
+            yr_df, x="ano", y="cancelamentos", color="tipo_cancelamento",
+            title="Cancelamentos de Destaque por Ano",
+            color_discrete_map={
+                "Formal": "#2563eb",
+                "Informal": "#d97706",
+            },
+            labels={
+                "ano": "Ano", "cancelamentos": "Cancelamentos",
+                "tipo_cancelamento": "Tipo",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack", xaxis_dtick=1)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --- Gap analysis (informal only) ---
+    informal = dc_f[dc_f["tipo_cancelamento"] == "Informal"]
+    if not informal.empty:
+        st.divider()
+        st.subheader("Análise do Intervalo – Cancelamentos Informais")
+        st.caption(
+            "Dias entre o destaque e o retorno à sessão virtual. "
+            "Gap = 0 indica cancelamento imediato (mesmo dia)."
+        )
+
+        gc1, gc2 = st.columns(2)
+        with gc1:
+            faixa_df = (
+                informal["faixa_gap"]
+                .value_counts()
+                .reindex([
+                    "Mesmo dia", "1–7 dias", "8–30 dias",
+                    "1–6 meses", "6–12 meses", ">1 ano",
+                ])
+                .dropna()
+                .reset_index()
+            )
+            faixa_df.columns = ["Faixa", "Casos"]
+            fig = px.bar(
+                faixa_df, x="Faixa", y="Casos",
+                title="Distribuição do Intervalo (destaque → retorno à virtual)",
+                text_auto=True,
+                color="Faixa",
+                color_discrete_sequence=px.colors.sequential.YlOrRd,
+            )
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with gc2:
+            fig = px.histogram(
+                informal, x="gap_dias",
+                title="Histograma: Dias entre Destaque e Retorno",
+                nbins=40,
+                labels={"gap_dias": "Dias", "count": "Ocorrências"},
+            )
+            fig.update_traces(marker_color="#d97706")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # --- Same-day vs delayed, by year ---
+        informal_cat = informal.copy()
+        informal_cat["categoria"] = informal_cat["gap_dias"].apply(
+            lambda d: "Mesmo dia (imediato)" if d == 0
+            else ("≤30 dias" if d <= 30 else ">30 dias")
+        )
+        cat_year = (
+            informal_cat.dropna(subset=["ano"])
+            .groupby(["ano", "categoria"])
+            .size()
+            .reset_index(name="casos")
+        )
+        cat_year["ano"] = cat_year["ano"].astype(int)
+        fig = px.bar(
+            cat_year, x="ano", y="casos", color="categoria",
+            title="Cancelamentos Informais por Ano: Imediatos vs Atrasados",
+            color_discrete_map={
+                "Mesmo dia (imediato)": "#16a34a",
+                "≤30 dias": "#d97706",
+                ">30 dias": "#dc2626",
+            },
+            labels={
+                "ano": "Ano", "casos": "Cancelamentos",
+                "categoria": "Intervalo",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack", xaxis_dtick=1)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # --- By class ---
+    st.divider()
+    cc3, cc4 = st.columns(2)
+    with cc3:
+        cls_df = (
+            dc_f.groupby(["classe", "tipo_cancelamento"])
+            .size()
+            .reset_index(name="cancelamentos")
+        )
+        fig = px.bar(
+            cls_df, x="classe", y="cancelamentos", color="tipo_cancelamento",
+            title="Cancelamentos por Classe",
+            color_discrete_map={
+                "Formal": "#2563eb",
+                "Informal": "#d97706",
+            },
+            labels={
+                "classe": "Classe", "cancelamentos": "Cancelamentos",
+                "tipo_cancelamento": "Tipo",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with cc4:
+        rel_df = (
+            dc_f["relator"]
+            .value_counts()
+            .head(15)
+            .reset_index()
+        )
+        rel_df.columns = ["Relator", "Cancelamentos"]
+        fig = px.bar(
+            rel_df, x="Cancelamentos", y="Relator", orientation="h",
+            title="Top 15 Relatores com Cancelamento de Destaque",
+            color="Cancelamentos", color_continuous_scale="OrRd",
         )
         fig.update_layout(yaxis=dict(categoryorder="total ascending"))
         fig.update_coloraxes(showscale=False)
         st.plotly_chart(fig, use_container_width=True)
 
-    julgadores = vr_f[vr_f["julgador"] != "NA"]
-    if not julgadores.empty:
-        julg_counts = julgadores["julgador"].value_counts().head(15).reset_index()
-        julg_counts.columns = ["Órgão Julgador", "Ocorrências"]
-        fig = px.bar(
-            julg_counts, x="Ocorrências", y="Órgão Julgador", orientation="h",
-            title="Órgão Julgador nas Decisões com Reajuste",
-            color="Ocorrências", color_continuous_scale="Teal",
-        )
-        fig.update_layout(yaxis=dict(categoryorder="total ascending"))
-        fig.update_coloraxes(showscale=False)
-        st.plotly_chart(fig, use_container_width=True)
+    # --- Explorer table ---
+    st.divider()
+    st.subheader("Tabela de Cancelamentos")
+    show_df = dc_f[[
+        "processo", "classe", "relator", "tipo_cancelamento",
+        "data_destaque", "data_retorno", "gap_dias", "faixa_gap",
+    ]].rename(columns={
+        "processo": "Processo",
+        "classe": "Classe",
+        "relator": "Relator",
+        "tipo_cancelamento": "Tipo",
+        "data_destaque": "Data Destaque",
+        "data_retorno": "Data Retorno",
+        "gap_dias": "Gap (dias)",
+        "faixa_gap": "Faixa",
+    }).sort_values("Data Destaque", ascending=True)
+    st.dataframe(show_df, use_container_width=True, height=500)
 
-    st.subheader("Detalhamento dos Votos Reajustados")
-    search_vr = st.text_input(
-        "Buscar por processo, relator ou texto:", "", key="vr_search"
+
+SESSAO_VOTO_COLORS = {
+    "Virtual": "#7c3aed",
+    "Presencial": "#0891b2",
+}
+
+
+def render_votos_alterados(
+    va: pd.DataFrame, vs: pd.DataFrame, df_main: pd.DataFrame,
+):
+    st.header("Votos Alterados (Reajustados) – Decisões")
+
+    if va.empty:
+        st.warning("Nenhum voto alterado encontrado nas decisões.")
+        return
+
+    filtered_processes = set(df_main["nome_processo"])
+    va_f = _enrich_votos_alterados(
+        va[va["processo"].isin(filtered_processes)].copy(), vs,
     )
-    vr_display = vr_f[[
-        "processo", "classe", "relator", "data", "andamento",
-        "julgador", "complemento",
+
+    if va_f.empty:
+        st.info("Nenhum voto alterado nos processos filtrados.")
+        return
+
+    # ---- KPIs ----
+    n_occurrences = len(va_f)
+    n_cases = va_f["processo"].nunique()
+    n_virtual = int((va_f["tipo_sessao_voto"] == "Virtual").sum())
+    n_presencial = int((va_f["tipo_sessao_voto"] == "Presencial").sum())
+    pct_cases = n_cases / len(df_main) * 100 if len(df_main) > 0 else 0
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Ocorrências de Voto Alterado", f"{n_occurrences:,}")
+    k2.metric("Processos com Voto Alterado", f"{n_cases:,}")
+    k3.metric("% dos Processos", f"{pct_cases:.2f}%")
+    k4.metric("Em Sessão Virtual", f"{n_virtual:,}")
+    k5.metric("Em Sessão Presencial", f"{n_presencial:,}")
+
+    st.divider()
+
+    # ---- Virtual vs Presencial ----
+    st.subheader("Sessão Virtual vs Presencial")
+
+    vp1, vp2 = st.columns(2)
+    with vp1:
+        sessao_df = va_f["tipo_sessao_voto"].value_counts().reset_index()
+        sessao_df.columns = ["Tipo de Sessão", "Ocorrências"]
+        fig = px.pie(
+            sessao_df, names="Tipo de Sessão", values="Ocorrências",
+            title="Votos Alterados: Virtual vs Presencial",
+            hole=0.4,
+            color="Tipo de Sessão",
+            color_discrete_map=SESSAO_VOTO_COLORS,
+        )
+        fig.update_traces(textinfo="value+percent")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with vp2:
+        sessao_year = (
+            va_f.dropna(subset=["ano"])
+            .groupby(["ano", "tipo_sessao_voto"])
+            .size()
+            .reset_index(name="ocorrencias")
+        )
+        if not sessao_year.empty:
+            sessao_year["ano"] = sessao_year["ano"].astype(int)
+            fig = px.bar(
+                sessao_year, x="ano", y="ocorrencias", color="tipo_sessao_voto",
+                title="Votos Alterados por Ano (Virtual vs Presencial)",
+                color_discrete_map=SESSAO_VOTO_COLORS,
+                labels={
+                    "ano": "Ano", "ocorrencias": "Ocorrências",
+                    "tipo_sessao_voto": "Tipo de Sessão",
+                },
+                text_auto=True,
+            )
+            fig.update_layout(barmode="stack", xaxis_dtick=1)
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ---- By Classe (case type) ----
+    st.subheader("Por Classe Processual")
+
+    cl1, cl2 = st.columns(2)
+    with cl1:
+        occ_classe = va_f["classe"].value_counts().reset_index()
+        occ_classe.columns = ["Classe", "Ocorrências"]
+        fig = px.bar(
+            occ_classe, x="Classe", y="Ocorrências",
+            title="Ocorrências de Voto Alterado por Classe",
+            color="Classe", color_discrete_map=COLORS,
+            text_auto=True,
+        )
+        fig.update_layout(showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with cl2:
+        cases_classe = (
+            va_f.drop_duplicates(subset=["processo"])["classe"]
+            .value_counts()
+            .reset_index()
+        )
+        cases_classe.columns = ["Classe", "Processos"]
+        fig = px.bar(
+            cases_classe, x="Classe", y="Processos",
+            title="Processos com Voto Alterado por Classe",
+            color="Classe", color_discrete_map=COLORS,
+            text_auto=True,
+        )
+        fig.update_layout(showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+    classe_sessao = (
+        va_f.groupby(["classe", "tipo_sessao_voto"])
+        .size()
+        .reset_index(name="ocorrencias")
+    )
+    fig = px.bar(
+        classe_sessao, x="classe", y="ocorrencias", color="tipo_sessao_voto",
+        title="Virtual vs Presencial por Classe",
+        color_discrete_map=SESSAO_VOTO_COLORS,
+        labels={
+            "classe": "Classe", "ocorrencias": "Ocorrências",
+            "tipo_sessao_voto": "Tipo de Sessão",
+        },
+        text_auto=True,
+    )
+    fig.update_layout(barmode="stack")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ---- By Tipo de Incidente ----
+    st.subheader("Por Tipo de Incidente")
+    st.caption(
+        "O tipo de incidente é identificado por cruzamento com as sessões virtuais. "
+        "Votos em sessões presenciais ou sem correspondência aparecem como "
+        "'Não identificado'."
+    )
+
+    ti1, ti2 = st.columns(2)
+    with ti1:
+        occ_inc = va_f["incidente_tipo"].value_counts().reset_index()
+        occ_inc.columns = ["Tipo de Incidente", "Ocorrências"]
+        fig = px.pie(
+            occ_inc, names="Tipo de Incidente", values="Ocorrências",
+            title="Ocorrências por Tipo de Incidente",
+            hole=0.4,
+            color="Tipo de Incidente",
+            color_discrete_map={**INCIDENT_TYPE_COLORS, "Não identificado": "#6b7280"},
+        )
+        fig.update_traces(textinfo="value+percent")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with ti2:
+        cases_inc = (
+            va_f.drop_duplicates(subset=["processo", "incidente_tipo"])
+            .groupby("incidente_tipo")
+            .size()
+            .reset_index(name="processos")
+        )
+        cases_inc.columns = ["Tipo de Incidente", "Processos"]
+        fig = px.bar(
+            cases_inc, x="Tipo de Incidente", y="Processos",
+            title="Processos com Voto Alterado por Tipo de Incidente",
+            color="Tipo de Incidente",
+            color_discrete_map={**INCIDENT_TYPE_COLORS, "Não identificado": "#6b7280"},
+            text_auto=True,
+        )
+        fig.update_layout(showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+    inc_year = (
+        va_f.dropna(subset=["ano"])
+        .groupby(["ano", "incidente_tipo"])
+        .size()
+        .reset_index(name="ocorrencias")
+    )
+    if not inc_year.empty:
+        inc_year["ano"] = inc_year["ano"].astype(int)
+        fig = px.bar(
+            inc_year, x="ano", y="ocorrencias", color="incidente_tipo",
+            title="Votos Alterados por Ano e Tipo de Incidente",
+            color_discrete_map={**INCIDENT_TYPE_COLORS, "Não identificado": "#6b7280"},
+            labels={
+                "ano": "Ano", "ocorrencias": "Ocorrências",
+                "incidente_tipo": "Tipo de Incidente",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack", xaxis_dtick=1)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ---- Classe × Incidente cross-tab ----
+    st.subheader("Classe × Tipo de Incidente")
+    cross = (
+        va_f.groupby(["classe", "incidente_tipo"])
+        .size()
+        .reset_index(name="ocorrencias")
+    )
+    fig = px.bar(
+        cross, x="classe", y="ocorrencias", color="incidente_tipo",
+        title="Ocorrências: Classe × Tipo de Incidente",
+        color_discrete_map={**INCIDENT_TYPE_COLORS, "Não identificado": "#6b7280"},
+        labels={
+            "classe": "Classe", "ocorrencias": "Ocorrências",
+            "incidente_tipo": "Tipo de Incidente",
+        },
+        text_auto=True,
+    )
+    fig.update_layout(barmode="stack")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ---- Relatores ----
+    st.subheader("Relatores")
+    rel_counts = va_f["relator"].value_counts().head(15).reset_index()
+    rel_counts.columns = ["Relator", "Ocorrências"]
+    fig = px.bar(
+        rel_counts, x="Ocorrências", y="Relator", orientation="h",
+        title="Top 15 Relatores com Votos Alterados",
+        color="Ocorrências", color_continuous_scale="Teal",
+    )
+    fig.update_layout(yaxis=dict(categoryorder="total ascending"))
+    fig.update_coloraxes(showscale=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ---- Explorer table ----
+    st.subheader("Detalhamento dos Votos Alterados")
+    search_va = st.text_input(
+        "Buscar por processo, relator ou texto:", "", key="va_search",
+    )
+    va_display = va_f[[
+        "processo", "classe", "relator", "data", "nome_decisao",
+        "julgador", "tipo_sessao_voto", "incidente_tipo", "complemento",
     ]].rename(columns={
         "processo": "Processo",
         "classe": "Classe",
         "relator": "Relator",
         "data": "Data",
-        "andamento": "Decisão",
+        "nome_decisao": "Decisão",
         "julgador": "Órgão Julgador",
+        "tipo_sessao_voto": "Tipo Sessão",
+        "incidente_tipo": "Tipo Incidente",
         "complemento": "Texto",
     }).sort_values("Data", ascending=False)
 
-    if search_vr:
+    if search_va:
         mask = (
-            vr_display["Processo"].str.contains(search_vr, case=False, na=False)
-            | vr_display["Relator"].str.contains(search_vr, case=False, na=False)
-            | vr_display["Texto"].str.contains(search_vr, case=False, na=False)
+            va_display["Processo"].str.contains(search_va, case=False, na=False)
+            | va_display["Relator"].str.contains(search_va, case=False, na=False)
+            | va_display["Texto"].str.contains(search_va, case=False, na=False)
         )
-        vr_display = vr_display[mask]
+        va_display = va_display[mask]
 
-    st.caption(f"{len(vr_display):,} ocorrências de votos reajustados")
-    st.dataframe(vr_display, use_container_width=True, height=500)
+    st.caption(f"{len(va_display):,} ocorrências de votos alterados")
+    st.dataframe(va_display, use_container_width=True, height=500)
+
+
+def render_situacao_processos(
+    venue: pd.DataFrame, vs: pd.DataFrame, df_main: pd.DataFrame,
+):
+    st.header("Situação dos Processos – Baixados e Modalidade de Julgamento")
+
+    if df_main.empty:
+        st.warning("Nenhum processo nos filtros atuais.")
+        return
+
+    # ---- merge venue into main df ----
+    merged = df_main.merge(
+        venue[["processo", "modalidade", "n_decisoes_virtual", "n_decisoes_presencial"]],
+        left_on="nome_processo",
+        right_on="processo",
+        how="left",
+    )
+    merged["modalidade"] = merged["modalidade"].fillna("Só monocrática (sem julgamento colegiado)")
+
+    # ---- primary incidente_tipo per case from VS data ----
+    if not vs.empty:
+        case_inc = (
+            vs.groupby("processo")["incidente_tipo"]
+            .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else "Não identificado")
+            .reset_index()
+            .rename(columns={"incidente_tipo": "incidente_principal"})
+        )
+        merged = merged.merge(
+            case_inc, left_on="nome_processo", right_on="processo",
+            how="left", suffixes=("", "_inc"),
+        )
+        merged["incidente_principal"] = merged["incidente_principal"].fillna("N/A")
+    else:
+        merged["incidente_principal"] = "N/A"
+
+    # ================================================================
+    # A) Baixados vs Em andamento
+    # ================================================================
+    st.subheader("Processos Baixados vs Em Andamento")
+
+    n_total = len(merged)
+    n_baixados = int((merged["status_processo"] == "Finalizado").sum())
+    n_andamento = int((merged["status_processo"] == "Em andamento").sum())
+
+    ka1, ka2, ka3 = st.columns(3)
+    ka1.metric("Total de Processos", f"{n_total:,}")
+    ka2.metric("Baixados (Finalizados)", f"{n_baixados:,}")
+    ka3.metric("Em Andamento", f"{n_andamento:,}")
+
+    sa1, sa2 = st.columns(2)
+    with sa1:
+        status_df = merged["status_processo"].value_counts().reset_index()
+        status_df.columns = ["Status", "Processos"]
+        fig = px.pie(
+            status_df, names="Status", values="Processos",
+            title="Situação dos Processos",
+            hole=0.4,
+            color="Status",
+            color_discrete_map={"Finalizado": "#16a34a", "Em andamento": "#2563eb"},
+        )
+        fig.update_traces(textinfo="value+percent")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with sa2:
+        status_year = (
+            merged.dropna(subset=["ano"])
+            .groupby(["ano", "status_processo"])
+            .size()
+            .reset_index(name="processos")
+        )
+        status_year["ano"] = status_year["ano"].astype(int)
+        fig = px.bar(
+            status_year, x="ano", y="processos", color="status_processo",
+            title="Situação por Ano de Protocolo",
+            color_discrete_map={"Finalizado": "#16a34a", "Em andamento": "#2563eb"},
+            labels={
+                "ano": "Ano", "processos": "Processos",
+                "status_processo": "Status",
+            },
+        )
+        fig.update_layout(barmode="stack", xaxis_dtick=2)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ================================================================
+    # B) Modalidade de Julgamento nos Baixados
+    # ================================================================
+    st.subheader("Modalidade de Julgamento – Processos Baixados")
+    st.caption(
+        "Para os processos finalizados, classifica-se a modalidade com base nas "
+        "decisões colegiadas (Tribunal Pleno / Turma): se todas mencionam "
+        "'Sessão Virtual' → **Só virtual**; se nenhuma menciona → **Só presencial**; "
+        "se há ambas → **Misto**."
+    )
+
+    baixados = merged[merged["status_processo"] == "Finalizado"]
+
+    if baixados.empty:
+        st.info("Nenhum processo baixado nos filtros atuais.")
+        return
+
+    n_virtual = int((baixados["modalidade"] == "Só virtual").sum())
+    n_presencial = int((baixados["modalidade"] == "Só presencial").sum())
+    n_misto = int((baixados["modalidade"] == "Misto (virtual e presencial)").sum())
+    n_sem = int((baixados["modalidade"] == "Só monocrática (sem julgamento colegiado)").sum())
+
+    kb1, kb2, kb3, kb4 = st.columns(4)
+    kb1.metric("Só Presencial", f"{n_presencial:,}")
+    kb2.metric("Só Virtual", f"{n_virtual:,}")
+    kb3.metric("Misto", f"{n_misto:,}")
+    kb4.metric("Só Monocrática", f"{n_sem:,}")
+
+    sb1, sb2 = st.columns(2)
+    with sb1:
+        mod_df = baixados["modalidade"].value_counts().reset_index()
+        mod_df.columns = ["Modalidade", "Processos"]
+        fig = px.pie(
+            mod_df, names="Modalidade", values="Processos",
+            title="Modalidade de Julgamento (Baixados)",
+            hole=0.4,
+            color="Modalidade",
+            color_discrete_map=MODALIDADE_COLORS,
+        )
+        fig.update_traces(textinfo="value+percent")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with sb2:
+        mod_year = (
+            baixados.dropna(subset=["ano"])
+            .groupby(["ano", "modalidade"])
+            .size()
+            .reset_index(name="processos")
+        )
+        mod_year["ano"] = mod_year["ano"].astype(int)
+        fig = px.bar(
+            mod_year, x="ano", y="processos", color="modalidade",
+            title="Modalidade por Ano de Protocolo (Baixados)",
+            color_discrete_map=MODALIDADE_COLORS,
+            labels={
+                "ano": "Ano", "processos": "Processos",
+                "modalidade": "Modalidade",
+            },
+        )
+        fig.update_layout(barmode="stack", xaxis_dtick=2)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ================================================================
+    # C) Segmentação por Ano — visão detalhada
+    # ================================================================
+    st.subheader("Evolução Temporal")
+
+    mod_year_full = (
+        merged.dropna(subset=["ano"])
+        .groupby(["ano", "status_processo", "modalidade"])
+        .size()
+        .reset_index(name="processos")
+    )
+    mod_year_full["ano"] = mod_year_full["ano"].astype(int)
+    fig = px.bar(
+        mod_year_full, x="ano", y="processos", color="modalidade",
+        facet_row="status_processo",
+        title="Modalidade por Ano – Baixados e Em Andamento",
+        color_discrete_map=MODALIDADE_COLORS,
+        labels={
+            "ano": "Ano", "processos": "Processos",
+            "modalidade": "Modalidade", "status_processo": "Status",
+        },
+    )
+    fig.update_layout(barmode="stack", xaxis_dtick=2, height=600)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ================================================================
+    # D) Segmentação por Classe e Tipo de Incidente
+    # ================================================================
+    st.subheader("Por Classe Processual")
+
+    dc1, dc2 = st.columns(2)
+    with dc1:
+        cls_status = (
+            merged.groupby(["classe", "status_processo"])
+            .size()
+            .reset_index(name="processos")
+        )
+        fig = px.bar(
+            cls_status, x="classe", y="processos", color="status_processo",
+            title="Baixados vs Em Andamento por Classe",
+            color_discrete_map={"Finalizado": "#16a34a", "Em andamento": "#2563eb"},
+            labels={
+                "classe": "Classe", "processos": "Processos",
+                "status_processo": "Status",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with dc2:
+        cls_mod = (
+            baixados.groupby(["classe", "modalidade"])
+            .size()
+            .reset_index(name="processos")
+        )
+        fig = px.bar(
+            cls_mod, x="classe", y="processos", color="modalidade",
+            title="Modalidade de Julgamento por Classe (Baixados)",
+            color_discrete_map=MODALIDADE_COLORS,
+            labels={
+                "classe": "Classe", "processos": "Processos",
+                "modalidade": "Modalidade",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("Por Tipo de Incidente")
+    st.caption(
+        "O tipo de incidente principal de cada processo é determinado pela sessão "
+        "virtual mais frequente (quando existente). Processos sem sessão virtual "
+        "aparecem como 'N/A'."
+    )
+
+    di1, di2 = st.columns(2)
+    with di1:
+        inc_status = (
+            merged.groupby(["incidente_principal", "status_processo"])
+            .size()
+            .reset_index(name="processos")
+        )
+        fig = px.bar(
+            inc_status, x="incidente_principal", y="processos",
+            color="status_processo",
+            title="Baixados vs Em Andamento por Tipo de Incidente",
+            color_discrete_map={"Finalizado": "#16a34a", "Em andamento": "#2563eb"},
+            labels={
+                "incidente_principal": "Tipo de Incidente",
+                "processos": "Processos",
+                "status_processo": "Status",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with di2:
+        baixados_inc = baixados[baixados["incidente_principal"] != "N/A"]
+        if not baixados_inc.empty:
+            inc_mod = (
+                baixados_inc.groupby(["incidente_principal", "modalidade"])
+                .size()
+                .reset_index(name="processos")
+            )
+            fig = px.bar(
+                inc_mod, x="incidente_principal", y="processos",
+                color="modalidade",
+                title="Modalidade por Tipo de Incidente (Baixados c/ Sessão Virtual)",
+                color_discrete_map=MODALIDADE_COLORS,
+                labels={
+                    "incidente_principal": "Tipo de Incidente",
+                    "processos": "Processos",
+                    "modalidade": "Modalidade",
+                },
+                text_auto=True,
+            )
+            fig.update_layout(barmode="stack")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Nenhum processo baixado com sessão virtual identificada.")
+
+    # ---- Classe × Incidente × Modalidade ----
+    st.divider()
+    st.subheader("Classe × Tipo de Incidente (Baixados)")
+
+    baixados_cross = baixados[baixados["incidente_principal"] != "N/A"]
+    if not baixados_cross.empty:
+        cross_df = (
+            baixados_cross.groupby(["classe", "incidente_principal", "modalidade"])
+            .size()
+            .reset_index(name="processos")
+        )
+        fig = px.bar(
+            cross_df, x="classe", y="processos", color="modalidade",
+            facet_col="incidente_principal",
+            title="Modalidade por Classe e Tipo de Incidente",
+            color_discrete_map=MODALIDADE_COLORS,
+            labels={
+                "classe": "Classe", "processos": "Processos",
+                "modalidade": "Modalidade",
+                "incidente_principal": "Incidente",
+            },
+            text_auto=True,
+        )
+        fig.update_layout(barmode="stack")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.divider()
+
+    # ---- Explorer table ----
+    st.subheader("Tabela de Processos")
+    display_cols = [
+        "nome_processo", "classe", "relator", "ano",
+        "status_processo", "modalidade",
+        "n_decisoes_virtual", "n_decisoes_presencial",
+        "incidente_principal",
+    ]
+    renamed = {
+        "nome_processo": "Processo",
+        "classe": "Classe",
+        "relator": "Relator",
+        "ano": "Ano",
+        "status_processo": "Status",
+        "modalidade": "Modalidade",
+        "n_decisoes_virtual": "Decisões Virtuais",
+        "n_decisoes_presencial": "Decisões Presenciais",
+        "incidente_principal": "Incidente Principal",
+    }
+    available = [c for c in display_cols if c in merged.columns]
+    show = merged[available].rename(
+        columns={k: v for k, v in renamed.items() if k in available}
+    ).sort_values("Ano" if "Ano" in renamed.values() else available[0], ascending=False)
+    st.caption(f"{len(show):,} processos")
+    st.dataframe(show, use_container_width=True, height=500)
 
 
 # --- Vista ---
@@ -2225,7 +3567,7 @@ def apply_sidebar_filters(df: pd.DataFrame) -> pd.DataFrame:
 
 # --- Main ---
 def main():
-    CSV_PATH = "ArquivosConcatenados_1.csv"
+    CSV_PATH = "ArquivosConcatenados.csv"
 
     if not os.path.exists(CSV_PATH):
         st.error(f"Arquivo `{CSV_PATH}` não encontrado. Coloque-o na raiz do projeto.")
@@ -2234,7 +3576,9 @@ def main():
     df_raw = load_data(CSV_PATH)
     vs_raw = load_virtual_sessions(CSV_PATH)
     dest_raw = load_destaques(CSV_PATH)
-    vr_raw = load_votos_reajustados(CSV_PATH)
+    dc_raw = load_destaque_cancelamentos(CSV_PATH)
+    va_raw = load_votos_alterados(CSV_PATH)
+    venue_raw = load_case_venue(CSV_PATH)
     vt_raw = load_vistas(CSV_PATH)
     df = apply_sidebar_filters(df_raw)
 
@@ -2254,8 +3598,10 @@ def main():
         "📈 Complexidade",
         "🖥️ Sessões Virtuais",
         "⚡ Destaques",
+        "🚫 Cancelamentos de Destaque",
         "👁️ Pedidos de Vista",
-        "🔄 Votos Reajustados",
+        "✏️ Votos Alterados",
+        "📋 Situação dos Processos",
         "🔍 Explorar",
     ])
 
@@ -2272,10 +3618,14 @@ def main():
     with tabs[5]:
         render_destaques(dest_raw, df)
     with tabs[6]:
-        render_vistas(vt_raw, df)
+        render_cancelamentos(dc_raw, df)
     with tabs[7]:
-        render_votos_reajustados(vr_raw, df)
+        render_vistas(vt_raw, df)
     with tabs[8]:
+        render_votos_alterados(va_raw, vs_raw, df)
+    with tabs[9]:
+        render_situacao_processos(venue_raw, vs_raw, df)
+    with tabs[10]:
         render_explorer(df)
 
 
